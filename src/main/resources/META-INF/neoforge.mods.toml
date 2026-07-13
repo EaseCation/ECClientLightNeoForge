@@ -6,7 +6,7 @@ version="${mod_version}"
 displayName="${mod_name}"
 authors="EaseCation"
 description='''
-Client-side light recomputation for the ViaProxy/ViaBedrock (Java -> Bedrock) link. Lets the Java client recompute chunk lighting locally with the vanilla LevelLightEngine (like Bedrock clients do), offloading the server-side light computation from ViaProxy. Spike stage: self-compute is hardcoded on for all chunks.
+Client-side light recomputation for the ViaProxy/ViaBedrock (Java -> Bedrock) link. ViaBedrock negotiates the mode during configuration; ordinary Java servers keep using server-provided light.
 '''
 
 [[mixins]]

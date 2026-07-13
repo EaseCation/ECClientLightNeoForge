@@ -7,6 +7,15 @@
     "defaultRequire": 1
   },
   "client": [
-    "ClientPacketListenerMixin"
+    "ClientCommonPacketListenerMixin",
+    "ClientLevelMixin",
+    "ClientPacketListenerMixin",
+    "LevelLightEngineAccessor",
+    "LevelLightEngineMixin",
+    "LayerLightSectionStorageInvoker",
+    "LightEngineMixin",
+    "LightEngineInvoker",
+    "LightEngineStorageAccessor",
+    "LevelRendererMixin"
   ]
 }

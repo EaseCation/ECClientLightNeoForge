@@ -1,73 +1,124 @@
 package net.easecation.ecclientlight.mixin;
 
-import net.easecation.ecclientlight.ECClientLight;
+import java.util.BitSet;
+import java.util.Iterator;
+import javax.annotation.Nullable;
+import net.easecation.ecclientlight.light.ClientLightManager;
+import net.easecation.ecclientlight.light.ClientPacketLightPolicy;
+import net.easecation.ecclientlight.network.ClientLightSession;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacketData;
-import net.minecraft.world.level.ChunkPos;
+import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
+import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-/**
- * Spike: make the Java client recompute chunk lighting locally instead of trusting the server.
- *
- * <p>Injection points (1.21.8 {@code ClientPacketListener}):
- * <ul>
- *   <li>{@code applyLightData} (HEAD, cancellable): in self-compute mode, skip loading the server
- *       light nibbles ({@code readSectionList}); only {@code setLightEnabled} for the column, then
- *       cancel — the local engine will derive light from block data instead.</li>
- *   <li>{@code enableChunkLight} (RETURN): vanilla has already called {@code updateSectionStatus}
- *       for every section (and {@code setSectionRangeDirty}), so section state is ready. Drive the
- *       local {@link LevelLightEngine}: {@code propagateLightSources} seeds sky light from the
- *       chunk heightmap and block light from block emission, then {@code runLightUpdates} spreads it.</li>
- * </ul>
- *
- * <p>Sodium is not touched: {@code runLightUpdates} triggers {@code ClientChunkCache.onLightUpdate}
- * -> {@code LevelRenderer.setSectionDirty}, which Sodium redirects into a chunk-mesh rebuild.
- *
- * <p>Spike scope: initial chunk load only. Standalone {@code ClientboundLightUpdatePacket}s (which
- * ViaBedrock's async engine emits when experimental light is on) are intercepted but not re-lit here;
- * the target setup sends placeholder light with experimental light off, so those don't occur. The
- * per-chunk {@code runLightUpdates} is intentionally eager for the spike (verify it lights up first);
- * batching / relying on the vanilla per-tick pump is a later optimisation.
- */
+/** Redirects chunk light ownership only after the configuration-phase capability ACK. */
 @Mixin(ClientPacketListener.class)
-public class ClientPacketListenerMixin {
+public abstract class ClientPacketListenerMixin {
 
     @Shadow
+    @Nullable
     private ClientLevel level;
 
+    @Unique
+    @Nullable
+    private ClientLevel ecclientlight$levelBeforeRespawn;
+
     @Inject(method = "applyLightData", at = @At("HEAD"), cancellable = true)
-    private void ecclientlight$skipServerLight(int chunkX, int chunkZ, ClientboundLightUpdatePacketData data, boolean bl, CallbackInfo ci) {
-        if (!ECClientLight.SELF_COMPUTE_LIGHT) {
-            return;
+    private void ecclientlight$skipServerLight(
+        int chunkX,
+        int chunkZ,
+        ClientboundLightUpdatePacketData data,
+        boolean updateTrustEdges,
+        CallbackInfo ci
+    ) {
+        if (ClientPacketLightPolicy.shouldSuppress(this.ecclientlight$isLocalLightActive(), updateTrustEdges)) {
+            // Combined chunk packets must return normally so renderer integrations observe light readiness.
+            ci.cancel();
         }
-        // Do not feed server nibbles; just enable the column so the local engine owns it.
-        this.level.getChunkSource().getLightEngine().setLightEnabled(new ChunkPos(chunkX, chunkZ), true);
-        ci.cancel();
+    }
+
+    @Inject(method = "readSectionList", at = @At("HEAD"), cancellable = true)
+    private void ecclientlight$preserveRetainedLight(
+        int chunkX,
+        int chunkZ,
+        LevelLightEngine lightEngine,
+        LightLayer lightLayer,
+        BitSet dataMask,
+        BitSet emptyMask,
+        Iterator<byte[]> updates,
+        boolean updateTrustEdges,
+        CallbackInfo ci
+    ) {
+        boolean localLightActive = this.ecclientlight$isLocalLightActive();
+        boolean retainedLightReady = localLightActive
+            && this.level != null
+            && ClientLightManager.shouldPreserveRetainedLight(this.level, chunkX, chunkZ);
+        if (
+            ClientPacketLightPolicy.shouldPreserveRetained(
+                localLightActive,
+                updateTrustEdges,
+                retainedLightReady
+            )
+        ) {
+            // Keep applyLightData itself running so Sodium still observes its RETURN readiness hook.
+            ci.cancel();
+        }
+    }
+
+    @Inject(method = "updateLevelChunk", at = @At("HEAD"))
+    private void ecclientlight$invalidateBeforeChunkMutation(
+        int chunkX,
+        int chunkZ,
+        ClientboundLevelChunkPacketData data,
+        CallbackInfo ci
+    ) {
+        if (this.ecclientlight$isLocalLightActive() && this.level != null) {
+            ClientLightManager.onFullChunkDataIngress(this.level, chunkX, chunkZ);
+        }
     }
 
     @Inject(method = "enableChunkLight", at = @At("RETURN"))
-    private void ecclientlight$recompute(LevelChunk chunk, int chunkX, int chunkZ, CallbackInfo ci) {
-        if (!ECClientLight.SELF_COMPUTE_LIGHT) {
+    private void ecclientlight$queueLocalLight(LevelChunk chunk, int chunkX, int chunkZ, CallbackInfo ci) {
+        if (!this.ecclientlight$isLocalLightActive() || this.level == null) {
             return;
         }
-        final LevelLightEngine lightEngine = this.level.getChunkSource().getLightEngine();
-        final ChunkPos pos = new ChunkPos(chunkX, chunkZ);
-        // Sky light from heightmap sources + block light from emission, then spread.
-        lightEngine.propagateLightSources(pos);
-        lightEngine.runLightUpdates();
 
-        if (!ecclientlight$firstLogged) {
-            ecclientlight$firstLogged = true;
-            ECClientLight.LOGGER.info("[ECClientLight] Local relight active — recomputed light for first chunk {},{}", chunkX, chunkZ);
+        ClientLightManager.onFullChunkData(this.level, chunk);
+    }
+
+    @Inject(method = "clearLevel", at = @At("HEAD"))
+    private void ecclientlight$clearLevelState(CallbackInfo ci) {
+        if (this.level != null) {
+            ClientLightManager.clearLevel(this.level);
         }
     }
 
-    private static boolean ecclientlight$firstLogged = false;
+    @Inject(method = "handleRespawn", at = @At("HEAD"))
+    private void ecclientlight$captureLevelBeforeRespawn(ClientboundRespawnPacket packet, CallbackInfo ci) {
+        this.ecclientlight$levelBeforeRespawn = this.level;
+    }
+
+    @Inject(method = "handleRespawn", at = @At("RETURN"))
+    private void ecclientlight$clearReplacedLevel(ClientboundRespawnPacket packet, CallbackInfo ci) {
+        ClientLevel previous = this.ecclientlight$levelBeforeRespawn;
+        this.ecclientlight$levelBeforeRespawn = null;
+        if (previous != null && previous != this.level) {
+            ClientLightManager.clearLevel(previous);
+        }
+    }
+
+    private boolean ecclientlight$isLocalLightActive() {
+        ClientPacketListener listener = (ClientPacketListener)(Object)this;
+        return ClientLightSession.isConfirmed(listener.getConnection());
+    }
 }

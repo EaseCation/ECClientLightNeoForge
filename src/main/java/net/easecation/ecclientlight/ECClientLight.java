@@ -1,8 +1,12 @@
 package net.easecation.ecclientlight;
 
+import net.easecation.ecclientlight.light.ClientLightManager;
+import net.easecation.ecclientlight.network.ClientLightSession;
+import net.easecation.ecclientlight.network.ConfirmClientLightPayload;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,22 +21,59 @@ import org.slf4j.LoggerFactory;
  * {@link net.minecraft.world.level.lighting.LevelLightEngine} (exactly like Bedrock clients),
  * so the server can stop computing light entirely.
  *
- * <p><b>Spike stage:</b> {@link #SELF_COMPUTE_LIGHT} is hardcoded on and every chunk is
- * relit locally, ignoring server light. A later stage gates this on a server handshake
- * signal (so vanilla / mod-less sessions keep server-side light as a fallback).
- *
- * <p>All behaviour lives in Mixins; this class only exists so NeoForge recognises the mod.
+ * <p>The mode is opt-in per connection. ViaBedrock confirms support during the configuration
+ * phase; ordinary Java servers continue to use their supplied light unchanged.
  */
 @Mod(value = ECClientLight.MOD_ID, dist = Dist.CLIENT)
 public class ECClientLight {
 
     public static final String MOD_ID = "ecclientlight";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
-
-    /** Spike: hardcoded self-compute for all chunks. Later gated by a server handshake signal. */
-    public static volatile boolean SELF_COMPUTE_LIGHT = true;
+    private static final boolean ENABLED = Boolean.parseBoolean(
+        System.getProperty("ecclientlight.enabled", "true")
+    );
 
     public ECClientLight(IEventBus modEventBus) {
-        LOGGER.info("[ECClientLight] Initialized. Self-compute light (spike) = {}", SELF_COMPUTE_LIGHT);
+        if (!ENABLED) {
+            LOGGER.warn("[ECClientLight] Disabled by -Decclientlight.enabled=false; proxy light remains active");
+            return;
+        }
+        if (!ClientLightManager.canNegotiateLocalLight()) {
+            LOGGER.error(
+                "[ECClientLight] Staging pipeline is unavailable; capability will not be advertised and proxy light remains active"
+            );
+            return;
+        }
+        modEventBus.addListener(ECClientLight::registerPayloadHandlers);
+        LOGGER.info(
+            "[ECClientLight] Initialized; local light remains disabled until ACK ({})",
+            ConfirmClientLightPayload.TYPE.id()
+        );
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug(
+                "[ECClientLight] Staging limits: frozen batches={} center(s), packet callbacks<= {}/frame, snapshot/publish budgets={}/{} us, published overlay={} MiB, retained light={} chunks/{} MiB/{} s, snapshot cache={} chunks/{} MiB",
+                ClientLightManager.maxBatchCenters(),
+                ClientLightManager.maxQueuedLightTasksPerFrame(),
+                ClientLightManager.snapshotMicrosPerFrame(),
+                ClientLightManager.publishMicrosPerFrame(),
+                ClientLightManager.maxOverlayBytes() / (1024L * 1024L),
+                ClientLightManager.maxRetainedLightChunks(),
+                ClientLightManager.maxRetainedLightBytes() / (1024L * 1024L),
+                ClientLightManager.retainedLightSeconds(),
+                ClientLightManager.maxSnapshotCacheChunks(),
+                ClientLightManager.maxSnapshotCacheBytes() / (1024L * 1024L)
+            );
+        }
     }
+
+    private static void registerPayloadHandlers(RegisterPayloadHandlersEvent event) {
+        event.registrar("1")
+            .optional()
+            .configurationToClient(
+                ConfirmClientLightPayload.TYPE,
+                ConfirmClientLightPayload.STREAM_CODEC,
+                (payload, context) -> ClientLightSession.confirm(context.connection())
+            );
+    }
+
 }

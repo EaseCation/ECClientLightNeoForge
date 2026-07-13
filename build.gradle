@@ -11,6 +11,11 @@ repositories {
     mavenCentral()
 }
 
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
+}
+
 base {
     archivesName = mod_id
 }
@@ -19,6 +24,7 @@ java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 
 neoForge {
     version = neo_version
+    addModdingDependenciesTo(sourceSets.test)
 
     runs {
         configureEach {
@@ -28,6 +34,17 @@ neoForge {
         }
         client {
             client()
+            if (providers.gradleProperty('quickPlaySingleplayer').isPresent()) {
+                programArgument '--quickPlaySingleplayer'
+                programArgument providers.gradleProperty('quickPlaySingleplayer').get()
+            }
+            if (providers.gradleProperty('quickPlayMultiplayer').isPresent()) {
+                programArgument '--quickPlayMultiplayer'
+                programArgument providers.gradleProperty('quickPlayMultiplayer').get()
+            }
+            if (providers.gradleProperty('mixinDebugExport').isPresent()) {
+                systemProperty 'mixin.debug.export', 'true'
+            }
         }
     }
 
@@ -57,4 +74,8 @@ tasks.withType(ProcessResources).configureEach {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
 }
