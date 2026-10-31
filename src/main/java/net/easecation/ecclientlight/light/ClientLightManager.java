@@ -31,11 +31,13 @@ import net.easecation.ecclientlight.network.ClientLightSession;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import net.minecraft.network.Connection;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.lighting.LevelLightEngine;
@@ -312,6 +314,10 @@ public final class ClientLightManager {
             }
         }
         state.pendingCommit = null;
+        // 代次已校验且正式亮度已提交，先撤掉临时值，再让网格读取最终亮度。
+        for (long chunkKey : commit.outputColumns) {
+            state.temporaryLight.removeColumn(chunkKey);
+        }
         publishDirtyColumns(level, dirtyColumns);
         state.centersSatisfiedByCoverage += state.scheduler.satisfyCovered(
             committedRevisions,
@@ -338,6 +344,7 @@ public final class ClientLightManager {
         }
         long now = System.nanoTime();
         long chunkKey = ChunkPos.asLong(chunkX, chunkZ);
+        state.temporaryLight.removeColumn(chunkKey);
         long generation = state.bumpRevision(chunkKey);
         LevelLightEngine lightEngine = level.getChunkSource().getLightEngine();
         boolean retainedReady = state.retainedLight.shouldPreserveIncomingLight(
@@ -419,6 +426,54 @@ public final class ClientLightManager {
         );
     }
 
+    /** 方块移除后，为正式光照尚未发布的空格提供六邻居平均亮度。 */
+    public static void onBlockChanged(ClientLevel level, BlockPos pos, BlockState oldState, BlockState newState) {
+        LevelState state = LEVEL_STATES.get(level);
+        if (state == null || state.cleared || state.failed) {
+            return;
+        }
+        if (!newState.isAir()) {
+            state.temporaryLight.remove(pos);
+            return;
+        }
+        if (oldState.isAir() || !LightEngine.hasDifferentLightProperties(oldState, newState)) {
+            return;
+        }
+
+        // 原版已在 setBlocksDirty 前调用 checkBlock，重算代次和队列由原有拦截维护。
+        LevelLightEngine lightEngine = level.getChunkSource().getLightEngine();
+        LightEngine<?, ?> blockEngine = lightEngine.getLayerListener(LightLayer.BLOCK) instanceof LightEngine<?, ?> engine
+            ? engine : null;
+        LightEngine<?, ?> skyEngine = lightEngine.getLayerListener(LightLayer.SKY) instanceof LightEngine<?, ?> engine
+            ? engine : null;
+        int blockSum = 0;
+        int skySum = 0;
+        int blockCount = 0;
+        int skyCount = 0;
+        BlockPos.MutableBlockPos neighbor = new BlockPos.MutableBlockPos();
+        for (Direction direction : Direction.values()) {
+            neighbor.set(pos.getX() + direction.getStepX(), pos.getY() + direction.getStepY(), pos.getZ() + direction.getStepZ());
+            if (level.isOutsideBuildHeight(neighbor)
+                || level.getChunkSource().getChunk(neighbor.getX() >> 4, neighbor.getZ() >> 4, false) == null) {
+                continue;
+            }
+            // 已加载方块的零亮度也是有效值；原版缺省光照层由存储自身解释。
+            if (blockEngine != null) {
+                blockSum += committedLightValue(blockEngine, neighbor);
+                blockCount++;
+            }
+            if (skyEngine != null) {
+                skySum += committedLightValue(skyEngine, neighbor);
+                skyCount++;
+            }
+        }
+        state.temporaryLight.put(
+            pos,
+            blockCount == 0 ? -1 : Math.round((float)blockSum / blockCount),
+            skyCount == 0 ? -1 : Math.round((float)skySum / skyCount)
+        );
+    }
+
     /** Redirects dynamic block changes into the snapshot pipeline instead of the live engine. */
     public static boolean interceptBlockChange(LevelLightEngine lightEngine, BlockPos pos) {
         LevelState state = LIVE_ENGINES.get(lightEngine);
@@ -463,6 +518,7 @@ public final class ClientLightManager {
         }
         LevelLightEngine lightEngine = level.getChunkSource().getLightEngine();
         long chunkKey = pos.toLong();
+        state.temporaryLight.removeColumn(chunkKey);
         boolean publishing = state.isColumnPublishing(chunkKey);
         releaseProvisional(level, state, chunkKey);
         RetainedLightCache.Entry previous = state.retainedLight.discard(chunkKey);
@@ -513,6 +569,48 @@ public final class ClientLightManager {
         return binding == null
             ? PublishedLightOverlay.View.NOT_PROTECTED
             : binding.overlay.publishedView().lightValue(binding.layer, packedBlockPos);
+    }
+
+    /** 同时覆盖单点查询与 Sodium 的整层快照查询，临时值不进入正式存储。 */
+    public static int renderLightValue(LightEngine<?, ?> engine, BlockPos pos) {
+        OverlayBinding binding = OVERLAY_BINDINGS.get(engine);
+        if (binding == null) {
+            return PublishedLightOverlay.View.NOT_PROTECTED;
+        }
+        int temporary = binding.temporaryLight.lightValue(binding.layer, pos);
+        return temporary >= 0 ? temporary : binding.overlay.publishedView().lightValue(binding.layer, pos.asLong());
+    }
+
+    public record RenderLayer(@Nullable DataLayer data) {
+    }
+
+    @Nullable
+    public static RenderLayer renderLayer(LightEngine<?, ?> engine, SectionPos pos) {
+        OverlayBinding binding = OVERLAY_BINDINGS.get(engine);
+        if (binding == null) {
+            return null;
+        }
+        PublishedLightOverlay.SectionSnapshot protectedSection = binding.overlay.publishedView().section(pos.asLong());
+        if (protectedSection == null && !binding.temporaryLight.containsSection(pos.asLong())) {
+            return null;
+        }
+        DataLayer original = protectedSection == null
+            ? ((LightEngineStorageAccessor)engine).ecclientlight$getStorage().getDataLayerData(pos.asLong())
+            : protectedSection.dataLayer(binding.layer);
+        DataLayer rendered = binding.temporaryLight.applyLayer(
+            binding.layer, pos, original, cursor -> committedLightValue(engine, cursor)
+        );
+        // null 层也可能是受保护的正式缺省值，不能因此退回正在分片安装的存储。
+        return new RenderLayer(rendered);
+    }
+
+    private static int committedLightValue(LightEngine<?, ?> engine, BlockPos pos) {
+        int protectedValue = overlayLightValue(engine, pos.asLong());
+        if (protectedValue >= 0) {
+            return protectedValue;
+        }
+        return ((LayerLightSectionStorageInvoker)((LightEngineStorageAccessor)engine).ecclientlight$getStorage())
+            .ecclientlight$getLightValue(pos.asLong());
     }
 
     public static boolean isOverlayColumnProtected(LevelLightEngine engine, long zeroNode) {
@@ -580,9 +678,9 @@ public final class ClientLightManager {
 
     private static void registerLiveEngine(LevelLightEngine lightEngine, LevelState state) {
         LIVE_ENGINES.put(lightEngine, state);
-        registerLayer(lightEngine, LightLayer.BLOCK, state.overlay);
+        registerLayer(lightEngine, LightLayer.BLOCK, state);
         if (state.hasSkyLight) {
-            registerLayer(lightEngine, LightLayer.SKY, state.overlay);
+            registerLayer(lightEngine, LightLayer.SKY, state);
         }
     }
 
@@ -708,10 +806,10 @@ public final class ClientLightManager {
     private static void registerLayer(
         LevelLightEngine lightEngine,
         LightLayer layer,
-        PublishedLightOverlay overlay
+        LevelState state
     ) {
         if (lightEngine.getLayerListener(layer) instanceof LightEngine<?, ?> engine) {
-            OVERLAY_BINDINGS.put(engine, new OverlayBinding(overlay, layer));
+            OVERLAY_BINDINGS.put(engine, new OverlayBinding(state.overlay, layer, state.temporaryLight));
         }
     }
 
@@ -1210,7 +1308,7 @@ public final class ClientLightManager {
         );
     }
 
-    private record OverlayBinding(PublishedLightOverlay overlay, LightLayer layer) {
+    private record OverlayBinding(PublishedLightOverlay overlay, LightLayer layer, TemporaryLightOverlay temporaryLight) {
     }
 
     private record DeferredOffer(long generation, long firstQueuedAt) {
@@ -1530,6 +1628,7 @@ public final class ClientLightManager {
         private final boolean hasSkyLight;
         private final FrozenRegionalRelightScheduler scheduler = new FrozenRegionalRelightScheduler(BATCH_LIMITS);
         private final PublishedLightOverlay overlay;
+        private final TemporaryLightOverlay temporaryLight = new TemporaryLightOverlay();
         private final RetainedLightCache retainedLight = new RetainedLightCache(
             MAX_RETAINED_LIGHT_CHUNKS,
             MAX_RETAINED_LIGHT_BYTES,
@@ -1651,6 +1750,7 @@ public final class ClientLightManager {
             }
             this.scheduler.clear();
             this.overlay.clear();
+            this.temporaryLight.clear();
             this.retainedLight.clear();
             this.snapshotCache.clear();
             this.revisions.clear();

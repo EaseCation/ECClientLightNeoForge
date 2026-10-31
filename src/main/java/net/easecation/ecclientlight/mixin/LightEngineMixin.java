@@ -5,10 +5,8 @@ import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.easecation.ecclientlight.light.ClientLightManager;
 import net.easecation.ecclientlight.light.LocalLightWorkBudget;
-import net.easecation.ecclientlight.light.PublishedLightOverlay;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
-import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.lighting.SkyLightEngine;
@@ -29,23 +27,15 @@ public abstract class LightEngineMixin {
         SectionPos pos,
         CallbackInfoReturnable<DataLayer> cir
     ) {
-        LightEngine<?, ?> engine = (LightEngine<?, ?>)(Object)this;
-        PublishedLightOverlay.SectionSnapshot snapshot = ClientLightManager.overlaySection(engine, pos.asLong());
-        if (snapshot == null) {
-            return;
-        }
-        LightLayer layer = ClientLightManager.overlayLayer(engine);
+        ClientLightManager.RenderLayer layer = ClientLightManager.renderLayer((LightEngine<?, ?>)(Object)this, pos);
         if (layer != null) {
-            cir.setReturnValue(snapshot.dataLayer(layer));
+            cir.setReturnValue(layer.data());
         }
     }
 
     @Inject(method = "getLightValue", at = @At("HEAD"), cancellable = true)
     private void ecclientlight$readPublishedValue(BlockPos pos, CallbackInfoReturnable<Integer> cir) {
-        int value = ClientLightManager.overlayLightValue(
-            (LightEngine<?, ?>)(Object)this,
-            pos.asLong()
-        );
+        int value = ClientLightManager.renderLightValue((LightEngine<?, ?>)(Object)this, pos);
         if (value >= 0) {
             cir.setReturnValue(value);
         }
