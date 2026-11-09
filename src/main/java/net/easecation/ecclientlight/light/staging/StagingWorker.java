@@ -14,7 +14,7 @@ public final class StagingWorker<I, O> implements AutoCloseable {
 
     private final Config config;
     private final ArrayBlockingQueue<QueuedJob<I, O>> pending;
-    private final ArrayBlockingQueue<StagingCompletion<O>> completions;
+    private final ArrayBlockingQueue<CompletionEnvelope<O>> completions;
     private final AtomicReference<QueuedJob<I, O>> active = new AtomicReference<>();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicLong completedJobs = new AtomicLong();
@@ -43,14 +43,16 @@ public final class StagingWorker<I, O> implements AutoCloseable {
             return handle;
         }
 
-        QueuedJob<I, O> queued = new QueuedJob<>(job, handle);
+        QueuedJob<I, O> queued = new QueuedJob<>(job, handle, net.easecation.performance.api.TraceLink.submission("ecclientlight","staging/job"));
         if (!this.pending.offer(queued)) {
+            queued.trace().cancel();
             handle.markRejected(StagingJobHandle.State.REJECTED_FULL);
             return handle;
         }
 
         // Close may race the first check. Remove the entry if the worker did not claim it.
         if (this.closed.get() && this.pending.remove(queued)) {
+            queued.trace().cancel();
             handle.markRejected(StagingJobHandle.State.REJECTED_CLOSED);
         }
         return handle;
@@ -64,11 +66,12 @@ public final class StagingWorker<I, O> implements AutoCloseable {
         Objects.requireNonNull(consumer, "consumer");
         int drained = 0;
         while (drained < maxCount) {
-            StagingCompletion<O> completion = this.completions.poll();
-            if (completion == null) {
+            CompletionEnvelope<O> envelope = this.completions.poll();
+            if (envelope == null) {
                 break;
             }
-            consumer.accept(completion);
+            long token=envelope.trace().begin();boolean failed=true;
+            try {consumer.accept(envelope.completion());failed=false;}finally{envelope.trace().end(token,failed);}
             drained++;
         }
         return drained;
@@ -124,7 +127,10 @@ public final class StagingWorker<I, O> implements AutoCloseable {
 
             this.active.set(queued);
             try {
-                this.execute(queued);
+                long traceToken=queued.trace().begin();
+                boolean traceFailed=true;
+                try {this.execute(queued);traceFailed=false;}
+                finally {queued.trace().end(traceToken,traceFailed);}
             } finally {
                 this.active.compareAndSet(queued, null);
             }
@@ -148,10 +154,11 @@ public final class StagingWorker<I, O> implements AutoCloseable {
         }
 
         try {
-            StagingJob.Computation<O> computation = Objects.requireNonNull(
-                queued.job().computationFactory().create(queued.job().input()),
-                "computationFactory returned null"
-            );
+            StagingJob.Computation<O> computation;
+            long factoryToken=net.easecation.performance.api.TraceLink.begin("ecclientlight","staging/factory");boolean factoryFailed=true;
+            try{
+                computation=Objects.requireNonNull(queued.job().computationFactory().create(queued.job().input()),"computationFactory returned null");factoryFailed=false;
+            }finally{net.easecation.performance.api.TraceLink.end(factoryToken,factoryFailed);}
             while (!this.closed.get() && !handle.isCancellationRequested()) {
                 long startedAt = System.nanoTime();
                 long deadline = saturatingAdd(startedAt, this.config.quantumNanos());
@@ -197,6 +204,7 @@ public final class StagingWorker<I, O> implements AutoCloseable {
     }
 
     private void publishCancelled(QueuedJob<I, O> queued) {
+        queued.trace().cancel();
         if (queued.handle().state().isTerminal()) {
             return;
         }
@@ -214,7 +222,7 @@ public final class StagingWorker<I, O> implements AutoCloseable {
         StagingJobHandle.State completedState
     ) {
         queued.handle().markTerminal(completedState);
-        if (!this.completions.offer(completion)) {
+        if (!this.completions.offer(new CompletionEnvelope<>(completion,net.easecation.performance.api.TraceLink.submission("ecclientlight","staging/main_apply")))) {
             queued.handle().markCompletionDropped(completedState);
             this.droppedCompletions.incrementAndGet();
         }
@@ -224,7 +232,9 @@ public final class StagingWorker<I, O> implements AutoCloseable {
         return value > Long.MAX_VALUE - increment ? Long.MAX_VALUE : value + increment;
     }
 
-    private record QueuedJob<I, O>(StagingJob<I, O> job, StagingJobHandle handle) {
+    private record CompletionEnvelope<O>(StagingCompletion<O> completion,net.easecation.performance.api.TraceLink.Submission trace) { }
+
+    private record QueuedJob<I, O>(StagingJob<I, O> job, StagingJobHandle handle, net.easecation.performance.api.TraceLink.Submission trace) {
     }
 
     public record Config(

@@ -161,13 +161,19 @@ public final class ClientLightManager {
 
     /** Establishes negotiated level state before the packet-light callback queue is drained. */
     public static void prepareLightUpdatePoll(ClientLevel level) {
-        drainWorkerCompletions();
-        if (!LEVEL_STATES.containsKey(level) && isNegotiatedCurrentLevel(level)) {
-            createLevelState(level);
-        }
-        LevelState state = LEVEL_STATES.get(level);
-        if (state != null) {
-            checkWorkerHealth(level, state);
+        var ecPerf = net.minecraft.util.profiling.Profiler.get();
+        ecPerf.push("ec:ecclientlight/prepare_poll");
+        try {
+            drainWorkerCompletions();
+            if (!LEVEL_STATES.containsKey(level) && isNegotiatedCurrentLevel(level)) {
+                createLevelState(level);
+            }
+            LevelState state = LEVEL_STATES.get(level);
+            if (state != null) {
+                checkWorkerHealth(level, state);
+            }
+        } finally {
+            ecPerf.pop();
         }
     }
 
@@ -179,48 +185,54 @@ public final class ClientLightManager {
 
     /** Advances only bounded client-thread ingestion/publication work after packet callbacks. */
     public static void afterLightUpdatePoll(ClientLevel level) {
-        LevelState state = LEVEL_STATES.get(level);
-        if (state == null || state.failed) {
-            return;
-        }
-        long sliceStart = System.nanoTime();
+        var ecPerf = net.minecraft.util.profiling.Profiler.get();
+        ecPerf.push("ec:ecclientlight/coordinator");
         try {
-            long now = sliceStart;
-            if (!flushPendingProvisionals(level, state)) {
+            LevelState state = LEVEL_STATES.get(level);
+            if (state == null || state.failed) {
                 return;
             }
-            releaseExpiredRetainedLight(level, state, now);
-            maybeLogStats(state, now);
-            retryDeferredOffers(state, 64);
-
-            if (state.pendingCommit != null) {
-                PendingCommit commit = state.pendingCommit;
-                PendingCommit.QueueStatus status = commit.queueBounded(level, state);
-                if (status == PendingCommit.QueueStatus.STALE) {
-                    supersedePendingCommit(level, state, commit);
+            long sliceStart = System.nanoTime();
+            try {
+                long now = sliceStart;
+                if (!flushPendingProvisionals(level, state)) {
+                    return;
                 }
-                return;
-            }
-            if (state.commitPreparation != null) {
-                advanceCommitPreparation(level, state);
-                return;
-            }
-            if (state.capture != null) {
-                advanceCapture(level, state);
-                return;
-            }
-            if (state.activeJobId != 0L) {
-                return;
-            }
-            startNextBatch(level, state, now);
-            if (state.capture != null) {
-                advanceCapture(level, state);
+                releaseExpiredRetainedLight(level, state, now);
+                maybeLogStats(state, now);
+                retryDeferredOffers(state, 64);
+
+                if (state.pendingCommit != null) {
+                    PendingCommit commit = state.pendingCommit;
+                    PendingCommit.QueueStatus status = commit.queueBounded(level, state);
+                    if (status == PendingCommit.QueueStatus.STALE) {
+                        supersedePendingCommit(level, state, commit);
+                    }
+                    return;
+                }
+                if (state.commitPreparation != null) {
+                    advanceCommitPreparation(level, state);
+                    return;
+                }
+                if (state.capture != null) {
+                    advanceCapture(level, state);
+                    return;
+                }
+                if (state.activeJobId != 0L) {
+                    return;
+                }
+                startNextBatch(level, state, now);
+                if (state.capture != null) {
+                    advanceCapture(level, state);
+                }
+            } finally {
+                state.maxCoordinatorSliceNanos = Math.max(
+                    state.maxCoordinatorSliceNanos,
+                    Math.max(0L, System.nanoTime() - sliceStart)
+                );
             }
         } finally {
-            state.maxCoordinatorSliceNanos = Math.max(
-                state.maxCoordinatorSliceNanos,
-                Math.max(0L, System.nanoTime() - sliceStart)
-            );
+            ecPerf.pop();
         }
     }
 
@@ -917,119 +929,131 @@ public final class ClientLightManager {
     }
 
     private static void advanceCapture(ClientLevel level, LevelState state) {
-        CaptureState capture = Objects.requireNonNull(state.capture);
-        StagingRevisionSnapshot.Validation validation = capture.revisions.validate(state);
-        if (!validation.isCurrent()) {
-            state.staleCaptures++;
-            abortAndRequeue(state, capture.batch);
-            state.capture = null;
-            return;
-        }
-
-        long deadline = System.nanoTime() + SNAPSHOT_BUDGET_NANOS;
-        while (capture.nextSource < capture.sourceColumns.size()) {
-            long chunkKey = capture.sourceColumns.get(capture.nextSource);
-            ChunkPos pos = new ChunkPos(chunkKey);
-            LevelChunk chunk = level.getChunkSource().getChunk(pos.x, pos.z, false);
-            if (chunk == null) {
+        var ecPerf = net.minecraft.util.profiling.Profiler.get();
+        ecPerf.push("ec:ecclientlight/snapshot");
+        try {
+            CaptureState capture = Objects.requireNonNull(state.capture);
+            StagingRevisionSnapshot.Validation validation = capture.revisions.validate(state);
+            if (!validation.isCurrent()) {
                 state.staleCaptures++;
                 abortAndRequeue(state, capture.batch);
                 state.capture = null;
                 return;
             }
-            long revision = capture.revisions.chunkRevisions().get(chunkKey);
-            if (capture.activeChunkCapture == null) {
-                StagingLightEngine.ChunkSnapshot cached = state.snapshotCache.get(chunkKey, revision);
-                if (cached != null) {
-                    capture.snapshots.add(cached);
-                    capture.nextSource++;
-                    if (System.nanoTime() >= deadline) {
-                        break;
-                    }
-                    continue;
+
+            long deadline = System.nanoTime() + SNAPSHOT_BUDGET_NANOS;
+            while (capture.nextSource < capture.sourceColumns.size()) {
+                long chunkKey = capture.sourceColumns.get(capture.nextSource);
+                ChunkPos pos = new ChunkPos(chunkKey);
+                LevelChunk chunk = level.getChunkSource().getChunk(pos.x, pos.z, false);
+                if (chunk == null) {
+                    state.staleCaptures++;
+                    abortAndRequeue(state, capture.batch);
+                    state.capture = null;
+                    return;
                 }
-                capture.activeChunkCapture = StagingLightEngine.beginChunkCapture(level, chunk);
+                long revision = capture.revisions.chunkRevisions().get(chunkKey);
+                if (capture.activeChunkCapture == null) {
+                    StagingLightEngine.ChunkSnapshot cached = state.snapshotCache.get(chunkKey, revision);
+                    if (cached != null) {
+                        capture.snapshots.add(cached);
+                        capture.nextSource++;
+                        if (System.nanoTime() >= deadline) {
+                            break;
+                        }
+                        continue;
+                    }
+                    capture.activeChunkCapture = StagingLightEngine.beginChunkCapture(level, chunk);
+                }
+                boolean complete = false;
+                do {
+                    complete = capture.activeChunkCapture.advance();
+                } while (!complete && System.nanoTime() < deadline);
+                if (!complete) {
+                    return;
+                }
+                StagingLightEngine.ChunkSnapshot snapshot = capture.activeChunkCapture.finish();
+                capture.activeChunkCapture = null;
+                state.snapshotCache.put(chunkKey, revision, snapshot, snapshot.estimatedBytes());
+                capture.snapshots.add(snapshot);
+                capture.nextSource++;
+                if (System.nanoTime() >= deadline) {
+                    break;
+                }
             }
-            boolean complete = false;
-            do {
-                complete = capture.activeChunkCapture.advance();
-            } while (!complete && System.nanoTime() < deadline);
-            if (!complete) {
+            if (capture.nextSource < capture.sourceColumns.size()) {
                 return;
             }
-            StagingLightEngine.ChunkSnapshot snapshot = capture.activeChunkCapture.finish();
-            capture.activeChunkCapture = null;
-            state.snapshotCache.put(chunkKey, revision, snapshot, snapshot.estimatedBytes());
-            capture.snapshots.add(snapshot);
-            capture.nextSource++;
-            if (System.nanoTime() >= deadline) {
-                break;
+            if (!capture.revisions.validate(state).isCurrent()) {
+                state.staleCaptures++;
+                abortAndRequeue(state, capture.batch);
+                state.capture = null;
+                return;
             }
-        }
-        if (capture.nextSource < capture.sourceColumns.size()) {
-            return;
-        }
-        if (!capture.revisions.validate(state).isCurrent()) {
-            state.staleCaptures++;
-            abortAndRequeue(state, capture.batch);
-            state.capture = null;
-            return;
-        }
 
-        LevelLightEngine liveEngine = level.getChunkSource().getLightEngine();
-        StagingLightEngine.Input input = new StagingLightEngine.Input(
-            level.getMinY(),
-            level.getHeight(),
-            state.hasSkyLight,
-            liveEngine.getMinLightSection(),
-            liveEngine.getLightSectionCount(),
-            capture.outputColumns,
-            capture.snapshots
-        );
-        long jobId = NEXT_JOB_ID.incrementAndGet();
-        StagingJob<StagingLightEngine.Input, StagingLightEngine.Result> job = new StagingJob<>(
-            jobId,
-            capture.revisions,
-            input,
-            StagingLightEngine::createComputation
-        );
-        StagingJobHandle handle = WorkerHolder.WORKER.submit(job);
-        if (handle.state() == StagingJobHandle.State.REJECTED_CLOSED) {
+            LevelLightEngine liveEngine = level.getChunkSource().getLightEngine();
+            StagingLightEngine.Input input = new StagingLightEngine.Input(
+                level.getMinY(),
+                level.getHeight(),
+                state.hasSkyLight,
+                liveEngine.getMinLightSection(),
+                liveEngine.getLightSectionCount(),
+                capture.outputColumns,
+                capture.snapshots
+            );
+            long jobId = NEXT_JOB_ID.incrementAndGet();
+            StagingJob<StagingLightEngine.Input, StagingLightEngine.Result> job = new StagingJob<>(
+                jobId,
+                capture.revisions,
+                input,
+                StagingLightEngine::createComputation
+            );
+            StagingJobHandle handle = WorkerHolder.WORKER.submit(job);
+            if (handle.state() == StagingJobHandle.State.REJECTED_CLOSED) {
+                state.capture = null;
+                failClosed(level, state, new IllegalStateException("Staging light worker is closed"));
+                return;
+            }
+            if (handle.state() == StagingJobHandle.State.REJECTED_FULL) {
+                state.workerBackpressure++;
+                return;
+            }
             state.capture = null;
-            failClosed(level, state, new IllegalStateException("Staging light worker is closed"));
-            return;
+            state.activeJobId = jobId;
+            state.activeJob = handle;
+            state.batchesSubmitted++;
+            state.jobOldestQueuedAt = capture.oldestQueuedAt;
+            JOB_OWNERS.put(jobId, state);
+        } finally {
+            ecPerf.pop();
         }
-        if (handle.state() == StagingJobHandle.State.REJECTED_FULL) {
-            state.workerBackpressure++;
-            return;
-        }
-        state.capture = null;
-        state.activeJobId = jobId;
-        state.activeJob = handle;
-        state.batchesSubmitted++;
-        state.jobOldestQueuedAt = capture.oldestQueuedAt;
-        JOB_OWNERS.put(jobId, state);
     }
 
     private static void drainWorkerCompletions() {
-        WorkerHolder.WORKER.drainCompletions(16, completion -> {
-            LevelState owner = JOB_OWNERS.remove(completion.jobId());
-            if (owner != null && !owner.cleared) {
-                acceptCompletion(owner, completion);
-            }
-        });
-        long dropped = WorkerHolder.WORKER.droppedCompletions();
-        if (dropped > observedDroppedCompletions) {
-            observedDroppedCompletions = dropped;
-            for (Map.Entry<ClientLevel, LevelState> entry : LEVEL_STATES.entrySet()) {
-                if (entry.getValue().activeJobId != 0L) {
-                    failClosed(
-                        entry.getKey(),
-                        entry.getValue(),
-                        new IllegalStateException("Staging completion queue overflowed")
-                    );
+        var ecPerf = net.minecraft.util.profiling.Profiler.get();
+        ecPerf.push("ec:ecclientlight/worker_completions");
+        try {
+            WorkerHolder.WORKER.drainCompletions(16, completion -> {
+                LevelState owner = JOB_OWNERS.remove(completion.jobId());
+                if (owner != null && !owner.cleared) {
+                    acceptCompletion(owner, completion);
+                }
+            });
+            long dropped = WorkerHolder.WORKER.droppedCompletions();
+            if (dropped > observedDroppedCompletions) {
+                observedDroppedCompletions = dropped;
+                for (Map.Entry<ClientLevel, LevelState> entry : LEVEL_STATES.entrySet()) {
+                    if (entry.getValue().activeJobId != 0L) {
+                        failClosed(
+                            entry.getKey(),
+                            entry.getValue(),
+                            new IllegalStateException("Staging completion queue overflowed")
+                        );
+                    }
                 }
             }
+        } finally {
+            ecPerf.pop();
         }
     }
 
@@ -1072,17 +1096,23 @@ public final class ClientLightManager {
     }
 
     private static void advanceCommitPreparation(ClientLevel level, LevelState state) {
-        CommitPreparation preparation = Objects.requireNonNull(state.commitPreparation);
-        if (!preparation.revisions.validate(state).isCurrent()) {
-            state.staleResults++;
-            state.commitPreparation = null;
-            abortAndRequeue(state, preparation.batch);
-            return;
-        }
-        PendingCommit commit = preparation.advance(level, state);
-        if (commit != null) {
-            state.commitPreparation = null;
-            state.pendingCommit = commit;
+        var ecPerf = net.minecraft.util.profiling.Profiler.get();
+        ecPerf.push("ec:ecclientlight/commit_prepare");
+        try {
+            CommitPreparation preparation = Objects.requireNonNull(state.commitPreparation);
+            if (!preparation.revisions.validate(state).isCurrent()) {
+                state.staleResults++;
+                state.commitPreparation = null;
+                abortAndRequeue(state, preparation.batch);
+                return;
+            }
+            PendingCommit commit = preparation.advance(level, state);
+            if (commit != null) {
+                state.commitPreparation = null;
+                state.pendingCommit = commit;
+            }
+        } finally {
+            ecPerf.pop();
         }
     }
 

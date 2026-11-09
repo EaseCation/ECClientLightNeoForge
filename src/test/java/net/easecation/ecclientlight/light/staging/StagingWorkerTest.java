@@ -21,6 +21,42 @@ import org.junit.jupiter.api.Timeout;
 
 class StagingWorkerTest {
 
+    @Test
+    @Timeout(5)
+    void optionalTraceFollowsWorkerAndCompletionWithoutChangingResult() {
+        var names=new java.util.concurrent.ConcurrentLinkedQueue<String>();
+        net.easecation.performance.api.TraceLink.Sink sink=new net.easecation.performance.api.TraceLink.Sink(){
+            public boolean enabled(){return true;}
+            public long queued(String owner,String operation){names.add("queue:"+operation);return 1;}
+            public long begin(long q,String owner,String operation){names.add("start:"+operation+":"+Thread.currentThread().getName());return 2;}
+            public void end(long token,boolean failed){names.add("end:"+failed);}
+        };
+        net.easecation.performance.api.TraceLink.install(sink);
+        try(StagingWorker<String,String> worker=new StagingWorker<>(config("trace-worker"))){
+            worker.submit(new StagingJob<>(91L,REVISIONS,"value",input->quantum->StagingJob.Step.complete(input)));
+            assertEquals("value",awaitCompletion(worker).result());
+            assertTrue(names.contains("queue:staging/job"));assertTrue(names.contains("queue:staging/main_apply"));
+            assertTrue(names.stream().anyMatch(n->n.startsWith("start:staging/job:")&&n.contains("trace-worker")));
+            assertTrue(names.stream().anyMatch(n->n.equals("start:staging/main_apply:"+Thread.currentThread().getName())));
+        }finally{net.easecation.performance.api.TraceLink.uninstall(sink);}
+    }
+
+    @Test @Timeout(5)
+    void tracedFactoryFailurePreservesFailureAndClosesItsScope(){
+        var ids=new java.util.concurrent.atomic.AtomicLong();var operations=new java.util.concurrent.ConcurrentHashMap<Long,String>();var ended=new java.util.concurrent.ConcurrentHashMap<String,Boolean>();
+        var failure=new IllegalStateException("fixture factory failure");
+        net.easecation.performance.api.TraceLink.Sink factorySink=new net.easecation.performance.api.TraceLink.Sink(){
+            public boolean enabled(){return true;}public long queued(String owner,String op){return 0;}
+            public long begin(long queued,String owner,String op){long id=ids.incrementAndGet();operations.put(id,op);return id;}
+            public void end(long id,boolean failed){ended.put(operations.remove(id),failed);}
+        };net.easecation.performance.api.TraceLink.install(factorySink);
+        try(StagingWorker<String,String> worker=new StagingWorker<>(config("factory-failure"))){
+            worker.submit(new StagingJob<>(92L,REVISIONS,"value",input->{throw failure;}));
+            var result=awaitCompletion(worker);assertEquals(StagingCompletion.Kind.FAILED,result.kind());org.junit.jupiter.api.Assertions.assertSame(failure,result.failure());
+            assertEquals(Boolean.TRUE,ended.get("staging/factory"));assertTrue(operations.isEmpty());
+        }finally{net.easecation.performance.api.TraceLink.uninstall(factorySink);}
+    }
+
     private static final StagingRevisionSnapshot REVISIONS =
         new StagingRevisionSnapshot(1L, Map.of(10L, 2L));
 

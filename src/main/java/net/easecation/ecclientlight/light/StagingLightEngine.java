@@ -48,7 +48,9 @@ final class StagingLightEngine {
     }
 
     static StagingJob.Computation<Result> createComputation(Input input) {
-        return new Computation(input);
+        long token=net.easecation.performance.api.TraceLink.begin("ecclientlight","staging/create[input="+input.chunks().size()+",output="+input.outputColumns().size()+",lightSections="+input.lightSectionCount()+",sky="+input.hasSkyLight()+"]");
+        boolean failed=true;
+        try{var result=new Computation(input);failed=false;return result;}finally{net.easecation.performance.api.TraceLink.end(token,failed);}
     }
 
     private static boolean isEmptyShape(BlockState state) {
@@ -247,36 +249,49 @@ final class StagingLightEngine {
 
         private Computation(Input input) {
             this.input = input;
-            this.world = new SnapshotWorld(input);
+            long snapshotToken=net.easecation.performance.api.TraceLink.begin("ecclientlight","staging/snapshot_world");boolean snapshotFailed=true;
+            try{this.world = new SnapshotWorld(input);snapshotFailed=false;}finally{net.easecation.performance.api.TraceLink.end(snapshotToken,snapshotFailed);}
+            long engineToken=net.easecation.performance.api.TraceLink.begin("ecclientlight","staging/create_engine");boolean engineFailed=true;
+            try{
             this.engine = new LevelLightEngine(this.world, true, input.hasSkyLight());
             LevelLightEngineAccessor accessor = (LevelLightEngineAccessor)(Object)this.engine;
             LightEngine<?, ?> block = accessor.ecclientlight$getBlockEngine();
             LightEngine<?, ?> sky = accessor.ecclientlight$getSkyEngine();
             this.blockEngine = block == null ? null : (BlockLightEngine)block;
             this.skyEngine = sky == null ? null : (SkyLightEngine)sky;
-            this.chunks = this.world.chunks();
+            this.chunks = this.world.chunks();engineFailed=false;
+            }finally{net.easecation.performance.api.TraceLink.end(engineToken,engineFailed);}
         }
 
         @Override
         public StagingJob.Step<Result> runQuantum(StagingJob.Quantum quantum) {
-            quantum.throwIfCancellationRequested();
-            while (!quantum.shouldYield()) {
-                switch (this.phase) {
-                    case INITIALIZE -> this.initializeOneChunk();
-                    case SEED -> this.seedOneChunk();
-                    case PROPAGATE -> {
-                        if (this.propagate(quantum)) {
-                            return StagingJob.Step.continueWork();
+            long traceToken=0;Phase tracedPhase=null;boolean traceFailed=true;
+            try {
+                quantum.throwIfCancellationRequested();
+                while (!quantum.shouldYield()) {
+                    // One scope per phase segment within a quantum, never per light node/block.
+                    if(this.phase!=tracedPhase){
+                        net.easecation.performance.api.TraceLink.end(traceToken,false);traceToken=0;tracedPhase=this.phase;
+                        String operation=switch(tracedPhase){case INITIALIZE->"staging/initialize";case SEED->"staging/seed";case PROPAGATE->"staging/propagate";case EXTRACT->"staging/extract";case COMPLETE->"staging/complete";};
+                        traceToken=net.easecation.performance.api.TraceLink.begin("ecclientlight",operation);
+                    }
+                    switch (this.phase) {
+                        case INITIALIZE -> this.initializeOneChunk();
+                        case SEED -> this.seedOneChunk();
+                        case PROPAGATE -> {
+                            if (this.propagate(quantum)) {
+                                traceFailed=false;return StagingJob.Step.continueWork();
+                            }
+                        }
+                        case EXTRACT -> this.extractOneColumn();
+                        case COMPLETE -> {
+                            var result=StagingJob.Step.complete(new Result(this.results));traceFailed=false;return result;
                         }
                     }
-                    case EXTRACT -> this.extractOneColumn();
-                    case COMPLETE -> {
-                        return StagingJob.Step.complete(new Result(this.results));
-                    }
+                    quantum.throwIfCancellationRequested();
                 }
-                quantum.throwIfCancellationRequested();
-            }
-            return StagingJob.Step.continueWork();
+                traceFailed=false;return StagingJob.Step.continueWork();
+            } finally {net.easecation.performance.api.TraceLink.end(traceToken,traceFailed);}
         }
 
         private void initializeOneChunk() {

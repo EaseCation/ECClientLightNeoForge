@@ -1,0 +1,24 @@
+{
+  "schema": "ec-scopes/1",
+  "modId": "ecclientlight",
+  "sections": [
+    "ec:ecclientlight/commit_prepare",
+    "ec:ecclientlight/coordinator",
+    "ec:ecclientlight/prepare_poll",
+    "ec:ecclientlight/snapshot",
+    "ec:ecclientlight/worker_completions"
+  ],
+  "taskOperations": [
+    "staging/job",
+    "staging/main_apply",
+    "staging/factory",
+    "staging/create[input,output,lightSections,sky]",
+    "staging/snapshot_world",
+    "staging/create_engine",
+    "staging/initialize",
+    "staging/seed",
+    "staging/propagate",
+    "staging/extract",
+    "staging/complete"
+  ]
+}
