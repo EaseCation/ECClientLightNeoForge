@@ -7,13 +7,25 @@ version = mod_version
 group = mod_group_id
 
 repositories {
+    // EaseCation private repository (Aliyun Yunxiao Packages), only for net.easecation.* coordinates.
+    // Credentials: yunxiaoMavenUsername / yunxiaoMavenPassword in ~/.gradle/gradle.properties.
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'yunxiaoMaven'
+                url = 'https://easecation-cn-hangzhou.devops.aliyuncs.com/packages/api/protocol/maven/14075-release-h64s7e'
+                credentials(PasswordCredentials)
+            }
+        }
+        filter { includeGroupByRegex 'net\\.easecation(\\..*)?' }
+    }
     maven { url = 'https://libraries.minecraft.net/' }
     mavenCentral()
 }
 
 dependencies {
-    implementation "net.easecation.clientdiagnostics:performance-api:1.0.0"
-    jarJar "net.easecation.clientdiagnostics:performance-api:1.0.0"
+    implementation "net.easecation.clientdiagnostics:performance-api:1.1.10"
+    jarJar "net.easecation.clientdiagnostics:performance-api:1.1.10"
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
 }
